@@ -11,8 +11,7 @@ from typing import Iterable
 import cv2
 import numpy as np
 
-from .contract import ACTION_NAMES, STATE_NAMES
-
+from .contract import ACTION_NAMES, STATE_NAMES, validate_sample_times
 
 VIDEO_KEYS = ("observation.images.ego", "observation.images.buoy_release")
 
@@ -90,37 +89,53 @@ def _modality() -> dict:
             "ego": {"original_key": VIDEO_KEYS[0]},
             "buoy_release": {"original_key": VIDEO_KEYS[1]},
         },
-        "annotation": {
-            "human.action.task_description": {"original_key": "task_index"}
-        },
+        "annotation": {"human.action.task_description": {"original_key": "task_index"}},
     }
 
 
-def export_dataset(staging_root: Path, output_root: Path, requested_fps: float | None) -> None:
+def export_dataset(
+    staging_root: Path, output_root: Path, requested_fps: float | None
+) -> None:
     episode_dirs = sorted(
-        path for path in staging_root.glob("episode_*") if (path / "manifest.json").is_file()
+        path
+        for path in staging_root.glob("episode_*")
+        if (path / "manifest.json").is_file()
     )
     if not episode_dirs:
         raise ValueError(f"No complete episode directories found in {staging_root}")
     if output_root.exists() and any(output_root.iterdir()):
         raise FileExistsError(f"Output directory is not empty: {output_root}")
 
+    manifests = [
+        json.loads((path / "manifest.json").read_text()) for path in episode_dirs
+    ]
+    recorded_fps = {float(manifest["fps"]) for manifest in manifests}
+    if requested_fps is None:
+        if len(recorded_fps) != 1:
+            raise ValueError(
+                f"Episodes contain multiple recording rates: {recorded_fps}"
+            )
+        fps = recorded_fps.pop()
+    else:
+        fps = float(requested_fps)
+    if not np.isfinite(fps) or fps <= 0.0:
+        raise ValueError("FPS must be positive")
+
+    if recorded_fps and any(not np.isclose(rate, fps) for rate in recorded_fps):
+        raise ValueError("--fps cannot retime demonstrations; resample them explicitly")
+    for episode_dir in episode_dirs:
+        with np.load(episode_dir / "samples.npz") as samples:
+            validate_sample_times(samples["ros_timestamp"], fps)
+            if not np.all(np.isfinite(samples["action"])) or np.any(
+                np.abs(samples["action"]) > 1
+            ):
+                raise ValueError(f"Invalid normalized action in {episode_dir}")
+
     output_root.mkdir(parents=True, exist_ok=True)
     metadata_dir = output_root / "meta"
     data_dir = output_root / "data" / "chunk-000"
     metadata_dir.mkdir(parents=True)
     data_dir.mkdir(parents=True)
-
-    manifests = [json.loads((path / "manifest.json").read_text()) for path in episode_dirs]
-    recorded_fps = {float(manifest["fps"]) for manifest in manifests}
-    if requested_fps is None:
-        if len(recorded_fps) != 1:
-            raise ValueError(f"Episodes contain multiple recording rates: {recorded_fps}")
-        fps = recorded_fps.pop()
-    else:
-        fps = float(requested_fps)
-    if fps <= 0.0:
-        raise ValueError("FPS must be positive")
 
     tasks = sorted({manifest["task"] for manifest in manifests})
     task_indices = {task: index for index, task in enumerate(tasks)}
@@ -153,10 +168,14 @@ def export_dataset(staging_root: Path, output_root: Path, requested_fps: float |
         frame_count = int(manifest["frames"])
         if state.shape != (frame_count, len(STATE_NAMES)):
             raise ValueError(f"Invalid state shape in {episode_dir}: {state.shape}")
+        if ros_timestamp.shape != (frame_count,):
+            raise ValueError(f"Invalid timestamp shape in {episode_dir}")
         if action.shape != (frame_count, len(ACTION_NAMES)):
             raise ValueError(f"Invalid action shape in {episode_dir}: {action.shape}")
         if rc_pwm.shape != (frame_count, len(ACTION_NAMES)):
-            raise ValueError(f"Invalid RC telemetry shape in {episode_dir}: {rc_pwm.shape}")
+            raise ValueError(
+                f"Invalid RC telemetry shape in {episode_dir}: {rc_pwm.shape}"
+            )
         if rc_update_mask.shape != (frame_count, len(ACTION_NAMES)):
             raise ValueError(
                 f"Invalid RC update-mask shape in {episode_dir}: {rc_update_mask.shape}"
@@ -194,7 +213,9 @@ def export_dataset(staging_root: Path, output_root: Path, requested_fps: float |
             "timestamp": frame_indices.astype(np.float64) / fps,
             "frame_index": frame_indices,
             "episode_index": np.full(frame_count, output_episode_index, dtype=np.int64),
-            "index": np.arange(global_index, global_index + frame_count, dtype=np.int64),
+            "index": np.arange(
+                global_index, global_index + frame_count, dtype=np.int64
+            ),
             "task_index": np.full(frame_count, task_index, dtype=np.int64),
             "telemetry.rc_pwm": [row for row in rc_pwm],
             "telemetry.rc_update_mask": [row for row in rc_update_mask],

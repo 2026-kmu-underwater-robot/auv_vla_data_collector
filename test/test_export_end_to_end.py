@@ -7,7 +7,6 @@ import pytest
 
 from kmu26_auv_vla_data_collector.export_lerobot import export_dataset
 
-
 pd = pytest.importorskip("pandas")
 pytest.importorskip("pyarrow")
 
@@ -30,7 +29,7 @@ def test_export_dataset_creates_u0_compatible_layout(tmp_path):
         action=np.zeros((3, 4), dtype=np.float32),
         rc_pwm=np.full((3, 4), 1500, dtype=np.int32),
         rc_update_mask=np.ones((3, 4), dtype=np.float32),
-        ros_timestamp=np.arange(3, dtype=np.float64),
+        ros_timestamp=np.arange(3, dtype=np.float64) / 10.0,
         source_age=np.zeros((3, 7), dtype=np.float32),
         source_timestamp=np.zeros((3, 7), dtype=np.float64),
     )

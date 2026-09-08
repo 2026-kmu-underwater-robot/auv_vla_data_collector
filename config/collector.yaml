@@ -1,14 +1,14 @@
 vla_data_collector:
   ros__parameters:
-    dataset_root: /home/kuuve/auv_ros2/vla_data/staging
+    dataset_root: ~/vla_data/staging
     record_rate_hz: 10.0
     max_sensor_age_sec: 0.25
     max_control_age_sec: 0.5
     jpeg_quality: 95
     default_task: ""
 
-    ego_image_topic: /camera/camera/color/image_raw/compressed
-    buoy_release_image_topic: /camera_release/camera/color/image_raw/compressed
+    ego_image_topic: /imx219/camera0/image_raw/compressed
+    buoy_release_image_topic: /imx219/camera1/image_raw/compressed
     dvl_twist_topic: /dvl/twist
     dvl_data_topic: /dvl/data
     imu_topic: /mavros/imu/data
@@ -21,3 +21,7 @@ vla_data_collector:
     neutral_pwm: 1500
     pwm_span: 300
     depth_pose_z_is_positive_up: true
+
+    body_frame: base_link
+    dvl_input_frame: dvl_link
+    dvl_convention: FRD
