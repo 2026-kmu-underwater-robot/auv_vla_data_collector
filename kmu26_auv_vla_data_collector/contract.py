@@ -6,7 +6,6 @@ from typing import Sequence
 
 import numpy as np
 
-
 STATE_NAMES = (
     "prev_surge",
     "prev_sway",
@@ -111,3 +110,83 @@ def build_state(
     if not np.all(np.isfinite(state)):
         raise ValueError("State contains a non-finite value")
     return state
+
+
+def sample_is_fresh(
+    source_time: float, received_time: float, now: float, max_age: float
+) -> bool:
+    """Require capture and receipt timestamps to be recent in the same clock [s]."""
+    return all(
+        np.isfinite(t) and 0.0 <= now - t <= max_age
+        for t in (source_time, received_time)
+    )
+
+
+def body_velocity(
+    values: Sequence[float], frame_id: str, input_frame: str, convention: str
+) -> np.ndarray:
+    """Convert the configured co-located DVL axes to body FLU velocity [m/s]."""
+    if frame_id != input_frame:
+        raise ValueError(f"Expected DVL frame {input_frame!r}, got {frame_id!r}")
+    value = np.asarray(values, dtype=np.float32)
+    if value.shape != (3,) or not np.all(np.isfinite(value)):
+        raise ValueError("DVL velocity must contain three finite values")
+    if convention == "FRD":
+        return value * np.array([1, -1, -1], dtype=np.float32)
+    if convention == "FLU":
+        return value
+    raise ValueError("DVL convention must be FRD or FLU")
+
+
+def validate_sample_times(timestamps: Sequence[float], fps: float) -> None:
+    """Reject clock resets, gaps and rate changes rather than compressing time."""
+    times = np.asarray(timestamps, dtype=np.float64)
+    if (
+        not np.isfinite(fps)
+        or fps <= 0
+        or times.ndim != 1
+        or not np.all(np.isfinite(times))
+    ):
+        raise ValueError("Finite timestamps and positive FPS are required")
+    if np.any(np.abs(np.diff(times) - 1.0 / fps) > 0.25 / fps):
+        raise ValueError(
+            "Episode has a clock reset or sampling gap; split/recollect it"
+        )
+
+
+class RcCommandTracker:
+    """Track explicit updates per axis; release invalidates ownership immediately."""
+
+    def __init__(self, indices=DEFAULT_ACTION_CHANNEL_INDICES, neutral=1500, span=300):
+        if (
+            len(indices) != 4
+            or len(set(indices)) != 4
+            or any(i < 0 or i > 7 for i in indices)
+        ):
+            raise ValueError("Four distinct primary RC channels (1..8) are required")
+        if span <= 0:
+            raise ValueError("PWM span must be positive")
+        self.indices, self.neutral, self.span = indices, neutral, span
+        self.command = np.zeros(4, dtype=np.float32)
+        self.updated_at = np.full(4, -np.inf)
+        self.valid = np.zeros(4, dtype=bool)
+
+    def update(self, channels, now):
+        mask = np.zeros(4, dtype=np.float32)
+        for axis, index in enumerate(self.indices):
+            pwm = int(channels[index]) if index < len(channels) else RC_NO_CHANGE
+            if pwm == RC_NO_CHANGE:
+                continue
+            if pwm == RC_RELEASE or not 1000 <= pwm <= 2000:
+                self.valid[axis] = False
+                self.command[axis] = 0.0
+                continue
+            self.command[axis] = np.clip((pwm - self.neutral) / self.span, -1, 1)
+            self.valid[axis] = True
+            self.updated_at[axis] = now
+            mask[axis] = 1.0
+        return self.command.copy(), mask
+
+    def fresh(self, now, max_age):
+        ages = now - self.updated_at
+        return bool(np.all(self.valid & (ages >= 0) & (ages <= max_age)))

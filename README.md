@@ -18,8 +18,8 @@ RC override는 motor PWM이 아니라 다음 순서의 정규화된 action label
 ```
 
 ArduSub 기본 채널은 각각 `[5, 6, 3, 4]`이며 파라미터로 변경할 수 있습니다. `0`
-(`CHAN_RELEASE`)과 `65535` (`CHAN_NOCHANGE`)는 새로운 명령으로 학습하지 않고 직전 명령을
-유지합니다.
+(`CHAN_RELEASE`)는 해당 축의 제어권을 무효화합니다. `65535` (`CHAN_NOCHANGE`)는
+직전 명령을 유지하지만 유효 시간을 갱신하지 않습니다.
 
 ## 빌드
 
@@ -28,7 +28,7 @@ cd /home/kuuve/auv_ros2
 source /opt/ros/humble/setup.bash
 colcon build --base-paths src --symlink-install \
   --packages-ignore mavros_msgs \
-  --packages-select dvl_msgs kmu26_auv_vla_data_collector
+  --packages-select auv_dvl_a50_msg kmu26_auv_vla_data_collector
 source install/setup.bash
 ```
 
@@ -117,6 +117,43 @@ ros2 run kmu26_auv_vla_data_collector export_lerobot \
 
 ## 중요한 제한
 
-현재 collector는 수신한 DVL/IMU 벡터를 숫자 그대로 저장합니다. 학습 전에 두 토픽이 모델
-계약과 동일한 body frame인지 반드시 확인해야 합니다. TF가 필요한 센서 프레임이라면
-collector 앞단에서 `base_link` 기준 토픽으로 변환해야 합니다.
+현재 ROV 기본 DVL 축 변환과 시각/RC 유효성 정책은 아래 Current ROV 절을 따릅니다.
+다른 장착 방향은 앞단에서 body frame으로 변환해야 합니다.
+
+## Current ROV / MuJoCo integration
+
+Use the checked-in `auv_dvl_a50_msg` dependency, not legacy `dvl_msgs`.
+The defaults now use `/imx219/camera0/image_raw/compressed` and
+`/imx219/camera1/image_raw/compressed`. Camera 1 must actually depict the release
+area for this embodiment; a stereo partner is not automatically a release camera.
+The dataset directory defaults to `~/vla_data/staging`.
+
+```bash
+colcon build --packages-select auv_dvl_a50_msg kmu26_auv_vla_data_collector
+source install/setup.bash
+# Simulation only; omit use_sim_time for the vehicle.
+ros2 launch kmu26_auv_vla_data_collector collector.launch.py use_sim_time:=true
+```
+
+`dvl_link` FRD vectors are converted once to body FLU (`x, -y, -z`). This matches
+the current ROV's X-pi DVL mounting transform. For a different mounting, provide
+an upstream body-frame velocity topic and set `dvl_input_frame:=base_link` and
+`dvl_convention:=FLU` in a custom YAML. Unknown DVL/IMU frames are rejected;
+IMU must already be in `body_frame` (default `base_link`). The collector does
+not infer arbitrary mounting transforms. Depth remains positive down in metres.
+
+Capture and receipt ages must both be valid. Clock resets and missed sampling
+intervals end the current recording with `sampling_discontinuity`; start a new
+episode after recovery. Export rejects gaps/rate changes instead of silently
+compressing time. Normal timer jitter up to 25% of a period is accepted.
+RC RELEASE invalidates the affected action immediately; NOCHANGE cannot renew
+an expired action. All four primary RC channels must have recent explicit
+commands. The prior helper remains available, but the recorder uses per-axis
+ownership tracking. Keep the same ArduSub mode, axis signs, neutral and PWM span
+across demonstrations and policy execution; default span 300 matches joy2mavros.
+
+Use `requirements-export.txt` in a separate export environment (plus OpenCV and
+system `ffmpeg`). Keep failed/recovery episodes separate unless deliberately
+including them in training; export does not silently filter `success=false`.
+The public `policy_observation(previous_command)` method exposes the same sensor
+contract to an inference adapter without publishing RC or requiring an RC source.

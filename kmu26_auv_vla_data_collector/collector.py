@@ -14,7 +14,7 @@ from typing import Any, Optional
 import cv2
 import numpy as np
 import rclpy
-from dvl_msgs.msg import DVL
+from auv_dvl_a50_msg.msg import DVL
 from geometry_msgs.msg import PoseWithCovarianceStamped, TwistWithCovarianceStamped
 from mavros_msgs.msg import OverrideRCIn
 from rclpy.node import Node
@@ -23,7 +23,15 @@ from sensor_msgs.msg import CompressedImage, Imu
 from std_msgs.msg import String
 from std_srvs.srv import SetBool, Trigger
 
-from .contract import ACTION_NAMES, STATE_NAMES, build_state, update_normalized_rc_command
+from .contract import (
+    ACTION_NAMES,
+    STATE_NAMES,
+    RcCommandTracker,
+    body_velocity,
+    build_state,
+    sample_is_fresh,
+    validate_sample_times,
+)
 
 
 @dataclass
@@ -40,7 +48,7 @@ def _stamp_to_seconds(message: Any, fallback: float) -> float:
     if stamp is None:
         return fallback
     value = float(stamp.sec) + float(stamp.nanosec) * 1.0e-9
-    return value if value > 0.0 else fallback
+    return value
 
 
 class VlaDataCollector(Node):
@@ -49,9 +57,7 @@ class VlaDataCollector(Node):
         self._lock = threading.RLock()
 
         self._dataset_root = Path(
-            self.declare_parameter(
-                "dataset_root", "/home/kuuve/auv_ros2/vla_data/staging"
-            ).value
+            self.declare_parameter("dataset_root", "~/vla_data/staging").value
         ).expanduser()
         self._rate_hz = float(self.declare_parameter("record_rate_hz", 10.0).value)
         self._max_sensor_age = float(
@@ -67,9 +73,7 @@ class VlaDataCollector(Node):
         )
         self._neutral_pwm = int(self.declare_parameter("neutral_pwm", 1500).value)
         self._pwm_span = int(self.declare_parameter("pwm_span", 300).value)
-        action_channels = self.declare_parameter(
-            "action_channels", [5, 6, 3, 4]
-        ).value
+        action_channels = self.declare_parameter("action_channels", [5, 6, 3, 4]).value
         if self._rate_hz <= 0.0:
             raise ValueError("record_rate_hz must be positive")
         if self._max_sensor_age <= 0.0 or self._max_control_age <= 0.0:
@@ -80,28 +84,48 @@ class VlaDataCollector(Node):
             int(value) < 1 or int(value) > 18 for value in action_channels
         ):
             raise ValueError("action_channels must contain [surge, sway, heave, yaw]")
-        self._action_channel_indices = tuple(int(value) - 1 for value in action_channels)
+        self._action_channel_indices = tuple(
+            int(value) - 1 for value in action_channels
+        )
+        self._rc_tracker = RcCommandTracker(
+            self._action_channel_indices, self._neutral_pwm, self._pwm_span
+        )
+        self._body_frame = str(self.declare_parameter("body_frame", "base_link").value)
+        self._dvl_input_frame = str(
+            self.declare_parameter("dvl_input_frame", "dvl_link").value
+        )
+        self._dvl_convention = str(
+            self.declare_parameter("dvl_convention", "FRD").value
+        )
+        if self._dvl_convention not in ("FRD", "FLU"):
+            raise ValueError("dvl_convention must be FRD or FLU")
 
         ego_topic = str(
             self.declare_parameter(
-                "ego_image_topic", "/camera/camera/color/image_raw/compressed"
+                "ego_image_topic", "/imx219/camera0/image_raw/compressed"
             ).value
         )
         release_topic = str(
             self.declare_parameter(
                 "buoy_release_image_topic",
-                "/camera_release/camera/color/image_raw/compressed",
+                "/imx219/camera1/image_raw/compressed",
             ).value
         )
-        dvl_twist_topic = str(self.declare_parameter("dvl_twist_topic", "/dvl/twist").value)
-        dvl_data_topic = str(self.declare_parameter("dvl_data_topic", "/dvl/data").value)
+        dvl_twist_topic = str(
+            self.declare_parameter("dvl_twist_topic", "/dvl/twist").value
+        )
+        dvl_data_topic = str(
+            self.declare_parameter("dvl_data_topic", "/dvl/data").value
+        )
         imu_topic = str(self.declare_parameter("imu_topic", "/mavros/imu/data").value)
         depth_topic = str(self.declare_parameter("depth_topic", "/depth/pose").value)
         rc_topic = str(
             self.declare_parameter("rc_override_topic", "/mavros/rc/override").value
         )
         task_topic = str(
-            self.declare_parameter("task_description_topic", "/vla/task_description").value
+            self.declare_parameter(
+                "task_description_topic", "/vla/task_description"
+            ).value
         )
         self._topics = {
             "ego_image": ego_topic,
@@ -143,7 +167,10 @@ class VlaDataCollector(Node):
             CompressedImage, ego_topic, self._on_ego_image, qos_profile_sensor_data
         )
         self.create_subscription(
-            CompressedImage, release_topic, self._on_release_image, qos_profile_sensor_data
+            CompressedImage,
+            release_topic,
+            self._on_release_image,
+            qos_profile_sensor_data,
         )
         self.create_subscription(
             TwistWithCovarianceStamped,
@@ -151,10 +178,15 @@ class VlaDataCollector(Node):
             self._on_dvl_twist,
             qos_profile_sensor_data,
         )
-        self.create_subscription(DVL, dvl_data_topic, self._on_dvl_data, qos_profile_sensor_data)
+        self.create_subscription(
+            DVL, dvl_data_topic, self._on_dvl_data, qos_profile_sensor_data
+        )
         self.create_subscription(Imu, imu_topic, self._on_imu, qos_profile_sensor_data)
         self.create_subscription(
-            PoseWithCovarianceStamped, depth_topic, self._on_depth, qos_profile_sensor_data
+            PoseWithCovarianceStamped,
+            depth_topic,
+            self._on_depth,
+            qos_profile_sensor_data,
         )
         self.create_subscription(OverrideRCIn, rc_topic, self._on_rc_override, 20)
         self.create_subscription(String, task_topic, self._on_task_description, 10)
@@ -166,8 +198,12 @@ class VlaDataCollector(Node):
 
         self._dataset_root.mkdir(parents=True, exist_ok=True)
         self.get_logger().info(f"Dataset staging root: {self._dataset_root}")
-        self.get_logger().info(f"Action order {ACTION_NAMES}, RC channels {action_channels}")
-        self.get_logger().info("Publish a task, then call ~/start_episode to begin recording")
+        self.get_logger().info(
+            f"Action order {ACTION_NAMES}, RC channels {action_channels}"
+        )
+        self.get_logger().info(
+            "Publish a task, then call ~/start_episode to begin recording"
+        )
 
     def _now(self) -> float:
         return self.get_clock().now().nanoseconds * 1.0e-9
@@ -199,7 +235,18 @@ class VlaDataCollector(Node):
 
     def _on_dvl_twist(self, message: TwistWithCovarianceStamped) -> None:
         velocity = message.twist.twist.linear
-        value = np.asarray([velocity.x, velocity.y, velocity.z], dtype=np.float32)
+        try:
+            value = body_velocity(
+                [velocity.x, velocity.y, velocity.z],
+                message.header.frame_id,
+                self._dvl_input_frame,
+                self._dvl_convention,
+            )
+        except ValueError as error:
+            self.get_logger().warning(str(error))
+            with self._lock:
+                self._dvl_twist = None
+            return
         if np.all(np.isfinite(value)):
             with self._lock:
                 self._dvl_twist = self._latest(message, value)
@@ -210,6 +257,13 @@ class VlaDataCollector(Node):
             self._dvl_data = self._latest(message, value)
 
     def _on_imu(self, message: Imu) -> None:
+        if (
+            message.header.frame_id != self._body_frame
+            or message.orientation_covariance[0] < 0
+        ):
+            with self._lock:
+                self._imu = None
+            return
         angular = message.angular_velocity
         linear = message.linear_acceleration
         orientation = message.orientation
@@ -233,18 +287,18 @@ class VlaDataCollector(Node):
 
     def _on_rc_override(self, message: OverrideRCIn) -> None:
         with self._lock:
-            command, update_mask = update_normalized_rc_command(
-                message.channels,
-                self._control_command,
-                channel_indices=self._action_channel_indices,
-                neutral_pwm=self._neutral_pwm,
-                pwm_span=self._pwm_span,
+            command, update_mask = self._rc_tracker.update(
+                message.channels, self._now()
             )
             self._control_command = command
             self._control_update_mask = update_mask
             selected_pwm = np.asarray(
                 [
-                    int(message.channels[index]) if index < len(message.channels) else 65535
+                    (
+                        int(message.channels[index])
+                        if index < len(message.channels)
+                        else 65535
+                    )
                     for index in self._action_channel_indices
                 ],
                 dtype=np.int32,
@@ -259,7 +313,9 @@ class VlaDataCollector(Node):
             self.get_logger().info(f"Task description set to: {task}")
 
     def _is_fresh(self, value: Optional[Latest], now: float, max_age: float) -> bool:
-        return value is not None and 0.0 <= now - value.received_time <= max_age
+        return value is not None and sample_is_fresh(
+            value.source_time, value.received_time, now, max_age
+        )
 
     def _missing_start_inputs(self, now: float) -> list[str]:
         checks = {
@@ -269,9 +325,75 @@ class VlaDataCollector(Node):
             ),
             "IMU": self._is_fresh(self._imu, now, self._max_sensor_age),
             "depth": self._is_fresh(self._depth, now, self._max_sensor_age),
-            "RC override": self._is_fresh(self._control, now, self._max_control_age),
+            "RC override": self._rc_tracker.fresh(now, self._max_control_age),
         }
         return [name for name, ready in checks.items() if not ready]
+
+    def policy_observation(self, previous_command: np.ndarray) -> dict:
+        """Build a fresh RGB/body-FLU policy input without requiring an RC publisher.
+
+        Raises:
+            ValueError: Required sensors or the instruction are unavailable/stale.
+        """
+        with self._lock:
+            now = self._now()
+            for name, value in (
+                ("ego", self._ego),
+                ("release", self._release),
+                ("imu", self._imu),
+                ("depth", self._depth),
+            ):
+                if not self._is_fresh(value, now, self._max_sensor_age):
+                    raise ValueError(f"Missing/stale {name}")
+            if not self._task_description:
+                raise ValueError("Missing task description")
+            raw_valid = self._is_fresh(self._dvl_data, now, self._max_sensor_age)
+            altitude, velocity_valid = (
+                self._dvl_data.value if raw_valid else (0.0, False)
+            )
+            dvl_valid = bool(
+                raw_valid
+                and velocity_valid
+                and self._is_fresh(self._dvl_twist, now, self._max_sensor_age)
+            )
+            altitude_valid = bool(raw_valid and np.isfinite(altitude) and altitude > 0)
+            angular, linear, attitude = self._imu.value
+            state = build_state(
+                previous_command,
+                self._dvl_twist.value if dvl_valid else np.zeros(3),
+                angular,
+                linear,
+                attitude,
+                self._depth.value,
+                altitude if altitude_valid else 0.0,
+                [1, 1, dvl_valid, altitude_valid],
+            )
+            slices = {
+                "prev_command": (0, 4),
+                "dvl_velocity": (4, 7),
+                "angular_velocity": (7, 10),
+                "linear_acceleration": (10, 13),
+                "attitude": (13, 17),
+                "depth": (17, 18),
+                "altitude": (18, 19),
+                "validity": (19, 23),
+            }
+            observation = {
+                f"state.{key}": state[a:b][None].copy()
+                for key, (a, b) in slices.items()
+            }
+            observation.update(
+                {
+                    "video.ego": cv2.cvtColor(self._ego.value, cv2.COLOR_BGR2RGB)[None],
+                    "video.buoy_release": cv2.cvtColor(
+                        self._release.value, cv2.COLOR_BGR2RGB
+                    )[None],
+                    "annotation.human.action.task_description": [
+                        self._task_description
+                    ],
+                }
+            )
+            return observation
 
     def _next_episode_index(self) -> int:
         indices = []
@@ -293,7 +415,9 @@ class VlaDataCollector(Node):
                 return response
             if not self._task_description:
                 response.success = False
-                response.message = "Publish a non-empty task description before recording"
+                response.message = (
+                    "Publish a non-empty task description before recording"
+                )
                 return response
             missing = self._missing_start_inputs(self._now())
             if missing:
@@ -308,7 +432,9 @@ class VlaDataCollector(Node):
             )
             if self._recording_dir.exists():
                 response.success = False
-                response.message = f"Temporary directory already exists: {self._recording_dir}"
+                response.message = (
+                    f"Temporary directory already exists: {self._recording_dir}"
+                )
                 return response
             (self._recording_dir / "frames" / "ego").mkdir(parents=True)
             (self._recording_dir / "frames" / "buoy_release").mkdir(parents=True)
@@ -339,7 +465,9 @@ class VlaDataCollector(Node):
                 return response
             if not self._states:
                 response.success = False
-                response.message = "No samples recorded yet; wait for data or discard the episode"
+                response.message = (
+                    "No samples recorded yet; wait for data or discard the episode"
+                )
                 return response
             episode_path = self._finish_episode(bool(request.data), "operator_stop")
             response.success = True
@@ -374,6 +502,14 @@ class VlaDataCollector(Node):
             if not self._active or self._recording_dir is None:
                 return
             now = self._now()
+            if self._ros_timestamps:
+                try:
+                    validate_sample_times(
+                        [self._ros_timestamps[-1], now], self._rate_hz
+                    )
+                except ValueError:
+                    self._finish_episode(False, "sampling_discontinuity")
+                    return
             if self._ego is None or self._release is None:
                 self._warn_skipped("camera has never produced an image", now)
                 return
@@ -383,13 +519,15 @@ class VlaDataCollector(Node):
             if not self._is_fresh(self._depth, now, self._max_sensor_age):
                 self._warn_skipped("stale depth", now)
                 return
-            if not self._is_fresh(self._control, now, self._max_control_age):
+            if not self._rc_tracker.fresh(now, self._max_control_age):
                 self._warn_skipped("stale RC override", now)
                 return
 
             ego_valid = self._is_fresh(self._ego, now, self._max_sensor_age)
             release_valid = self._is_fresh(self._release, now, self._max_sensor_age)
-            dvl_message_fresh = self._is_fresh(self._dvl_data, now, self._max_sensor_age)
+            dvl_message_fresh = self._is_fresh(
+                self._dvl_data, now, self._max_sensor_age
+            )
             dvl_twist_fresh = self._is_fresh(self._dvl_twist, now, self._max_sensor_age)
             altitude, dvl_reported_valid = (
                 self._dvl_data.value if self._dvl_data is not None else (0.0, False)
@@ -397,7 +535,9 @@ class VlaDataCollector(Node):
             altitude_valid = bool(
                 dvl_message_fresh and np.isfinite(altitude) and altitude > 0.0
             )
-            dvl_valid = bool(dvl_twist_fresh and dvl_message_fresh and dvl_reported_valid)
+            dvl_valid = bool(
+                dvl_twist_fresh and dvl_message_fresh and dvl_reported_valid
+            )
             dvl_velocity = (
                 self._dvl_twist.value if dvl_valid else np.zeros(3, dtype=np.float32)
             )
@@ -432,20 +572,23 @@ class VlaDataCollector(Node):
             ego_path = (
                 self._recording_dir / "frames" / "ego" / f"frame_{frame_index:06d}.jpg"
             )
-            release_path = self._recording_dir / "frames" / "buoy_release" / (
-                f"frame_{frame_index:06d}.jpg"
+            release_path = (
+                self._recording_dir
+                / "frames"
+                / "buoy_release"
+                / (f"frame_{frame_index:06d}.jpg")
             )
             ego_path.write_bytes(ego_jpeg.tobytes())
             release_path.write_bytes(release_jpeg.tobytes())
 
             source_ages = np.asarray(
                 [
-                    now - self._ego.received_time,
-                    now - self._release.received_time,
-                    now - self._imu.received_time,
-                    now - self._depth.received_time,
-                    now - self._dvl_twist.received_time if self._dvl_twist else np.nan,
-                    now - self._dvl_data.received_time if self._dvl_data else np.nan,
+                    now - self._ego.source_time,
+                    now - self._release.source_time,
+                    now - self._imu.source_time,
+                    now - self._depth.source_time,
+                    now - self._dvl_twist.source_time if self._dvl_twist else np.nan,
+                    now - self._dvl_data.source_time if self._dvl_data else np.nan,
                     now - self._control.received_time,
                 ],
                 dtype=np.float32,
@@ -500,6 +643,8 @@ class VlaDataCollector(Node):
             "state_names": list(STATE_NAMES),
             "action_names": list(ACTION_NAMES),
             "state_conventions": {
+                "body_vectors": "FLU",
+                "dvl_input_convention": self._dvl_convention,
                 "attitude": "quaternion_wxyz",
                 "depth": "positive_down_m",
                 "action": "normalized_body_command_minus1_to_plus1",
@@ -537,7 +682,9 @@ def main(args: Optional[list[str]] = None) -> None:
         pass
     finally:
         try:
-            if node._active:  # Preserve an interrupted recording instead of deleting it.
+            if (
+                node._active
+            ):  # Preserve an interrupted recording instead of deleting it.
                 with node._lock:
                     if node._states:
                         node._finish_episode(False, "node_shutdown")

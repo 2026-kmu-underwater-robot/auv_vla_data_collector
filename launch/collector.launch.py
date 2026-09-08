@@ -1,8 +1,10 @@
 from ament_index_python.packages import get_package_share_directory
+from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
+
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.substitutions import LaunchConfiguration
-from launch_ros.actions import Node
 
 
 def generate_launch_description():
@@ -13,8 +15,9 @@ def generate_launch_description():
             DeclareLaunchArgument("config", default_value=default_config),
             DeclareLaunchArgument(
                 "buoy_release_image_topic",
-                default_value="/camera_release/camera/color/image_raw/compressed",
+                default_value="/imx219/camera1/image_raw/compressed",
             ),
+            DeclareLaunchArgument("use_sim_time", default_value="false"),
             Node(
                 package="kmu26_auv_vla_data_collector",
                 executable="collector",
@@ -23,9 +26,12 @@ def generate_launch_description():
                 parameters=[
                     LaunchConfiguration("config"),
                     {
+                        "use_sim_time": ParameterValue(
+                            LaunchConfiguration("use_sim_time"), value_type=bool
+                        ),
                         "buoy_release_image_topic": LaunchConfiguration(
                             "buoy_release_image_topic"
-                        )
+                        ),
                     },
                 ],
             ),
