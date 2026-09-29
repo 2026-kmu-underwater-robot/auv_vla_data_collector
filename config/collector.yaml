@@ -25,3 +25,10 @@ vla_data_collector:
     body_frame: base_link
     dvl_input_frame: dvl_link
     dvl_convention: FRD
+
+    # Use task_demonstration only after setting the session and acquisition context.
+    collection_kind: connection_check
+    data_source: unknown
+    session_id: ""
+    provenance_file: ""
+    expected_mode: STABILIZE

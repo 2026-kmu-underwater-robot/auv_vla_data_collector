@@ -157,3 +157,9 @@ system `ffmpeg`). Keep failed/recovery episodes separate unless deliberately
 including them in training; export does not silently filter `success=false`.
 The public `policy_observation(previous_command)` method exposes the same sensor
 contract to an inference adapter without publishing RC or requiring an RC source.
+
+## Real-vehicle recording integrity
+
+See [real-data fixes and migration](docs/REAL_DATA_FIXES.md) for camera/DVL validity,
+interrupted recording handling, export checks, and the explicit task-recording
+settings. Simulator-only integration is maintained separately on `uuvsim`.

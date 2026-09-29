@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Sequence
+from collections.abc import Sequence
 
 import numpy as np
 
@@ -125,7 +125,7 @@ def sample_is_fresh(
 def body_velocity(
     values: Sequence[float], frame_id: str, input_frame: str, convention: str
 ) -> np.ndarray:
-    """Convert the configured co-located DVL axes to body FLU velocity [m/s]."""
+    """Rotate DVL axes to FLU [m/s], retaining the DVL acoustic-origin reference."""
     if frame_id != input_frame:
         raise ValueError(f"Expected DVL frame {input_frame!r}, got {frame_id!r}")
     value = np.asarray(values, dtype=np.float32)
@@ -177,7 +177,11 @@ class RcCommandTracker:
             pwm = int(channels[index]) if index < len(channels) else RC_NO_CHANGE
             if pwm == RC_NO_CHANGE:
                 continue
-            if pwm == RC_RELEASE or not 1000 <= pwm <= 2000:
+            if (
+                pwm == RC_RELEASE
+                or not 1000 <= pwm <= 2000
+                or abs(pwm - self.neutral) > self.span
+            ):
                 self.valid[axis] = False
                 self.command[axis] = 0.0
                 continue
