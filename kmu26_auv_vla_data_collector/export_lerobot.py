@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import shutil
 import subprocess
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Iterable
 
 import cv2
 import numpy as np
@@ -33,6 +35,19 @@ def _statistics(array: np.ndarray) -> dict[str, list[float]]:
     }
 
 
+def resolve_ffmpeg() -> str:
+    """Find the existing encoder before creating any export artifacts."""
+    binary = shutil.which("ffmpeg")
+    local = Path.home() / ".local/bin/ffmpeg"
+    if binary:
+        return binary
+    if local.is_file() and os.access(local, os.X_OK):
+        return str(local)
+    raise RuntimeError(
+        "FFmpeg is required for LeRobot export; install the system dependencies."
+    )
+
+
 def _encode_video(frame_dir: Path, output_path: Path, fps: float) -> tuple[int, int]:
     first_frame = cv2.imread(str(frame_dir / "frame_000000.jpg"), cv2.IMREAD_COLOR)
     if first_frame is None:
@@ -40,7 +55,7 @@ def _encode_video(frame_dir: Path, output_path: Path, fps: float) -> tuple[int, 
     height, width = first_frame.shape[:2]
     output_path.parent.mkdir(parents=True, exist_ok=True)
     command = [
-        "ffmpeg",
+        resolve_ffmpeg(),
         "-hide_banner",
         "-loglevel",
         "error",
@@ -106,9 +121,36 @@ def export_dataset(
     if output_root.exists() and any(output_root.iterdir()):
         raise FileExistsError(f"Output directory is not empty: {output_root}")
 
+    resolve_ffmpeg()
+
     manifests = [
         json.loads((path / "manifest.json").read_text()) for path in episode_dirs
     ]
+    contracts = []
+    for manifest in manifests:
+        for key, expected in (
+            ("state_names", STATE_NAMES),
+            ("action_names", ACTION_NAMES),
+        ):
+            if key in manifest and tuple(manifest[key]) != expected:
+                raise ValueError(f"Incompatible {key}; remap explicitly before export")
+        provenance = manifest.get("provenance", {})
+        contracts.append(
+            json.dumps(
+                {
+                    "conventions": manifest.get("state_conventions"),
+                    "channels": provenance.get("action_channels"),
+                    "neutral": provenance.get("neutral_pwm"),
+                    "span": provenance.get("pwm_span"),
+                    "imu_motion": provenance.get("imu_motion"),
+                },
+                sort_keys=True,
+            )
+        )
+    if len(set(contracts)) != 1:
+        raise ValueError(
+            "Incompatible acquisition contracts; export separately and reconcile before mixing"
+        )
     recorded_fps = {float(manifest["fps"]) for manifest in manifests}
     if requested_fps is None:
         if len(recorded_fps) != 1:
@@ -123,13 +165,60 @@ def export_dataset(
 
     if recorded_fps and any(not np.isclose(rate, fps) for rate in recorded_fps):
         raise ValueError("--fps cannot retime demonstrations; resample them explicitly")
-    for episode_dir in episode_dirs:
+    for episode_dir, manifest in zip(episode_dirs, manifests):
         with np.load(episode_dir / "samples.npz") as samples:
+            count = int(manifest["frames"])
+            if count < 1 or not str(manifest["task"]).strip():
+                raise ValueError(f"Empty episode or instruction in {episode_dir}")
+            for key, shape in {
+                "observation_state": (count, 23),
+                "action": (count, 4),
+                "rc_pwm": (count, 4),
+                "rc_update_mask": (count, 4),
+                "ros_timestamp": (count,),
+                "source_age": (count, 7),
+                "source_timestamp": (count, 7),
+            }.items():
+                if samples[key].shape != shape:
+                    raise ValueError(f"Invalid {key} shape in {episode_dir}")
+            if not np.all(np.isfinite(samples["observation_state"])):
+                raise ValueError(f"Nonfinite state in {episode_dir}")
+            for key in ("source_timestamp", "receipt_timestamp"):
+                if key in samples:
+                    stamps = samples[key]
+                    if stamps.shape != (count, 7):
+                        raise ValueError(f"Invalid {key} in {episode_dir}")
+                    required = np.ones((count, 7), dtype=bool)
+                    # Missing DVL packets are represented by NaN timestamps and
+                    # zero validity flags; they are not corrupt camera/IMU data.
+                    required[:, 4] = samples["observation_state"][:, 21] != 0
+                    required[:, 5] = np.any(
+                        samples["observation_state"][:, 21:23] != 0, axis=1
+                    )
+                    if (
+                        not np.isfinite(stamps[required]).all()
+                        or np.isinf(stamps).any()
+                    ):
+                        raise ValueError(f"Invalid {key} in {episode_dir}")
             validate_sample_times(samples["ros_timestamp"], fps)
             if not np.all(np.isfinite(samples["action"])) or np.any(
                 np.abs(samples["action"]) > 1
             ):
                 raise ValueError(f"Invalid normalized action in {episode_dir}")
+
+        for camera in ("ego", "buoy_release"):
+            frame_dir = episode_dir / "frames" / camera
+            expected = [f"frame_{i:06d}.jpg" for i in range(count)]
+            if sorted(p.name for p in frame_dir.glob("frame_*.jpg")) != expected:
+                raise ValueError(f"Frames must be contiguous in {frame_dir}")
+            shape = None
+            for name in expected:
+                image = cv2.imread(str(frame_dir / name))
+                if image is None or (shape is not None and image.shape != shape):
+                    raise ValueError(f"Unreadable or resized image: {frame_dir / name}")
+                shape = image.shape
+            if shape[0] % 2 or shape[1] % 2:
+                raise ValueError("H264 yuv420p requires even image dimensions")
 
     output_root.mkdir(parents=True, exist_ok=True)
     metadata_dir = output_root / "meta"
@@ -228,6 +317,19 @@ def export_dataset(
             ),
             "next.reward": np.zeros(frame_count, dtype=np.float32),
         }
+        with np.load(episode_dir / "samples.npz") as samples:
+            for key in ("receipt_timestamp", "rc_axis_timestamp"):
+                if key in samples:
+                    data[f"telemetry.{key}"] = [row for row in samples[key]]
+        audit_dir = metadata_dir / "acquisition" / f"episode_{output_episode_index:06d}"
+        audit_dir.mkdir(parents=True)
+        for name in ("manifest.json", "vehicle_state.jsonl"):
+            if (episode_dir / name).is_file():
+                shutil.copyfile(episode_dir / name, audit_dir / name)
+        if (episode_dir / "collector_source").is_dir():
+            shutil.copytree(
+                episode_dir / "collector_source", audit_dir / "collector_source"
+            )
         dataframe = pd.DataFrame(data)
         dataframe.to_parquet(
             data_dir / f"episode_{output_episode_index:06d}.parquet",
@@ -243,6 +345,9 @@ def export_dataset(
                 "tasks": [manifest["task"]],
                 "length": frame_count,
                 "success": bool(manifest["success"]),
+                "termination_reason": manifest.get("termination_reason", "unknown"),
+                "provenance": manifest.get("provenance", {"data_source": "unknown"}),
+                "source_episode": episode_dir.name,
             }
         )
         global_index += frame_count
@@ -289,9 +394,9 @@ def export_dataset(
         "total_tasks": len(tasks),
         "total_videos": len(episode_rows) * len(VIDEO_KEYS),
         "total_chunks": 1,
-        "chunks_size": 1000,
+        "chunks_size": max(1000, len(episode_rows)),
         "fps": fps,
-        "splits": {"train": "0:100"},
+        "splits": {"train": f"0:{len(episode_rows)}"},
         "data_path": "data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet",
         "video_path": (
             "videos/chunk-{episode_chunk:03d}/{video_key}/episode_{episode_index:06d}.mp4"
@@ -320,6 +425,8 @@ def export_dataset(
         ({"task_index": index, "task": task} for task, index in task_indices.items()),
     )
     _jsonl(metadata_dir / "episodes.jsonl", episode_rows)
+    # Keep the complete acquisition contract, including interruption and calibration.
+    _jsonl(metadata_dir / "source_manifests.jsonl", manifests)
 
     print(
         f"Exported {len(episode_rows)} episodes, {global_index} frames, "

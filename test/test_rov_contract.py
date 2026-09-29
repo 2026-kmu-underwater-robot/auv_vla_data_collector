@@ -59,3 +59,9 @@ def test_export_refuses_discontinuous_time(times):
 
 def test_normal_timer_jitter_is_accepted():
     validate_sample_times([1, 1.11, 1.2, 1.3], 10)
+
+
+def test_pwm_outside_declared_span_is_not_clipped_into_valid_label():
+    tracker = RcCommandTracker(span=300)
+    tracker.update([1900] * 18, 1.0)
+    assert not tracker.fresh(1.1, 0.5)
