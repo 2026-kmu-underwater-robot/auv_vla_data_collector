@@ -11,9 +11,11 @@ from typing import Iterable
 import cv2
 import numpy as np
 
-from .contract import ACTION_NAMES, STATE_NAMES, validate_sample_times
+from .contract import ACTION_NAMES, STATE_NAMES, STATE_SLICES, validate_sample_times
 
 VIDEO_KEYS = ("observation.images.ego", "observation.images.buoy_release")
+CODEBASE_VERSION = "v2.0"
+CHUNKS_SIZE = 1000
 
 
 def _jsonl(path: Path, rows: Iterable[dict]) -> None:
@@ -66,25 +68,25 @@ def _encode_video(frame_dir: Path, output_path: Path, fps: float) -> tuple[int, 
 
 
 def _modality() -> dict:
-    state_dimensions = (4, 3, 3, 3, 4, 1, 1, 4)
-    state_keys = (
-        "prev_command",
-        "dvl_velocity",
-        "angular_velocity",
-        "linear_acceleration",
-        "attitude",
-        "depth",
-        "altitude",
-        "validity",
-    )
-    start = 0
-    state = {}
-    for key, dimension in zip(state_keys, state_dimensions):
-        state[key] = {"start": start, "end": start + dimension}
-        start += dimension
     return {
-        "state": state,
-        "action": {"motion": {"start": 0, "end": 4}},
+        "state": {
+            key: {
+                "start": start,
+                "end": end,
+                "original_key": "observation.state",
+                "dtype": "float32",
+            }
+            for key, (start, end) in STATE_SLICES.items()
+        },
+        "action": {
+            "motion": {
+                "start": 0,
+                "end": len(ACTION_NAMES),
+                "original_key": "action",
+                "dtype": "float32",
+                "absolute": True,
+            }
+        },
         "video": {
             "ego": {"original_key": VIDEO_KEYS[0]},
             "buoy_release": {"original_key": VIDEO_KEYS[1]},
@@ -123,8 +125,35 @@ def export_dataset(
 
     if recorded_fps and any(not np.isclose(rate, fps) for rate in recorded_fps):
         raise ValueError("--fps cannot retime demonstrations; resample them explicitly")
-    for episode_dir in episode_dirs:
+    for episode_dir, manifest in zip(episode_dirs, manifests):
+        if not isinstance(manifest["task"], str) or not manifest["task"].strip():
+            raise ValueError(f"Missing task description in {episode_dir}")
+        for key, names in (
+            ("state_names", STATE_NAMES),
+            ("action_names", ACTION_NAMES),
+        ):
+            if key in manifest and manifest[key] != list(names):
+                raise ValueError(f"Incompatible {key} order in {episode_dir}")
         with np.load(episode_dir / "samples.npz") as samples:
+            frame_count = int(manifest["frames"])
+            if frame_count <= 0:
+                raise ValueError(f"Empty episode in {episode_dir}")
+            expected_shapes = {
+                "observation_state": (frame_count, len(STATE_NAMES)),
+                "action": (frame_count, len(ACTION_NAMES)),
+                "rc_pwm": (frame_count, len(ACTION_NAMES)),
+                "rc_update_mask": (frame_count, len(ACTION_NAMES)),
+                "ros_timestamp": (frame_count,),
+                "source_age": (frame_count, 7),
+                "source_timestamp": (frame_count, 7),
+            }
+            for key, shape in expected_shapes.items():
+                if samples[key].shape != shape:
+                    raise ValueError(
+                        f"Invalid {key} shape in {episode_dir}: {samples[key].shape}"
+                    )
+            if not np.all(np.isfinite(samples["observation_state"])):
+                raise ValueError(f"Non-finite state in {episode_dir}")
             validate_sample_times(samples["ros_timestamp"], fps)
             if not np.all(np.isfinite(samples["action"])) or np.any(
                 np.abs(samples["action"]) > 1
@@ -133,9 +162,7 @@ def export_dataset(
 
     output_root.mkdir(parents=True, exist_ok=True)
     metadata_dir = output_root / "meta"
-    data_dir = output_root / "data" / "chunk-000"
     metadata_dir.mkdir(parents=True)
-    data_dir.mkdir(parents=True)
 
     tasks = sorted({manifest["task"] for manifest in manifests})
     task_indices = {task: index for index, task in enumerate(tasks)}
@@ -156,6 +183,10 @@ def export_dataset(
     for output_episode_index, (episode_dir, manifest) in enumerate(
         zip(episode_dirs, manifests)
     ):
+        episode_chunk = output_episode_index // CHUNKS_SIZE
+        chunk_name = f"chunk-{episode_chunk:03d}"
+        data_dir = output_root / "data" / chunk_name
+        data_dir.mkdir(parents=True, exist_ok=True)
         with np.load(episode_dir / "samples.npz") as samples:
             state = samples["observation_state"].astype(np.float32)
             action = samples["action"].astype(np.float32)
@@ -166,21 +197,6 @@ def export_dataset(
             source_timestamp = samples["source_timestamp"].astype(np.float64)
 
         frame_count = int(manifest["frames"])
-        if state.shape != (frame_count, len(STATE_NAMES)):
-            raise ValueError(f"Invalid state shape in {episode_dir}: {state.shape}")
-        if ros_timestamp.shape != (frame_count,):
-            raise ValueError(f"Invalid timestamp shape in {episode_dir}")
-        if action.shape != (frame_count, len(ACTION_NAMES)):
-            raise ValueError(f"Invalid action shape in {episode_dir}: {action.shape}")
-        if rc_pwm.shape != (frame_count, len(ACTION_NAMES)):
-            raise ValueError(
-                f"Invalid RC telemetry shape in {episode_dir}: {rc_pwm.shape}"
-            )
-        if rc_update_mask.shape != (frame_count, len(ACTION_NAMES)):
-            raise ValueError(
-                f"Invalid RC update-mask shape in {episode_dir}: {rc_update_mask.shape}"
-            )
-
         for camera_name, video_key in zip(("ego", "buoy_release"), VIDEO_KEYS):
             frame_dir = episode_dir / "frames" / camera_name
             frame_files = sorted(frame_dir.glob("frame_*.jpg"))
@@ -192,7 +208,7 @@ def export_dataset(
             video_path = (
                 output_root
                 / "videos"
-                / "chunk-000"
+                / chunk_name
                 / video_key
                 / f"episode_{output_episode_index:06d}.mp4"
             )
@@ -279,19 +295,27 @@ def export_dataset(
             "episode_index": {"dtype": "int64", "shape": [1]},
             "index": {"dtype": "int64", "shape": [1]},
             "task_index": {"dtype": "int64", "shape": [1]},
+            "telemetry.rc_pwm": {"dtype": "int32", "shape": [4]},
+            "telemetry.rc_update_mask": {"dtype": "float32", "shape": [4]},
+            "telemetry.ros_timestamp": {"dtype": "float64", "shape": [1]},
+            "telemetry.source_age": {"dtype": "float32", "shape": [7]},
+            "telemetry.source_timestamp": {"dtype": "float64", "shape": [7]},
+            "episode_success": {"dtype": "bool", "shape": [1]},
+            "next.done": {"dtype": "bool", "shape": [1]},
+            "next.reward": {"dtype": "float32", "shape": [1]},
         }
     )
     info = {
-        "codebase_version": "v2.1",
+        "codebase_version": CODEBASE_VERSION,
         "robot_type": "kmu26_auv_real",
         "total_episodes": len(episode_rows),
         "total_frames": global_index,
         "total_tasks": len(tasks),
         "total_videos": len(episode_rows) * len(VIDEO_KEYS),
-        "total_chunks": 1,
-        "chunks_size": 1000,
+        "total_chunks": (len(episode_rows) + CHUNKS_SIZE - 1) // CHUNKS_SIZE,
+        "chunks_size": CHUNKS_SIZE,
         "fps": fps,
-        "splits": {"train": "0:100"},
+        "splits": {"train": f"0:{len(episode_rows)}"},
         "data_path": "data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet",
         "video_path": (
             "videos/chunk-{episode_chunk:03d}/{video_key}/episode_{episode_index:06d}.mp4"

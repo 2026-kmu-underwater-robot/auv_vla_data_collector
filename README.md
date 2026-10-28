@@ -113,7 +113,69 @@ ros2 run kmu26_auv_vla_data_collector export_lerobot \
 ```
 
 출력 폴더가 비어 있지 않으면 변환기는 덮어쓰지 않고 중단합니다. 변환 결과는
-`kmu26_auv_vla` 저장소의 `--data-config kmu26_auv_real`과 바로 대응합니다.
+`/home/pc/Downloads/auv_vla_training`의 `--data-config kmu_auv`과 대응합니다.
+
+### 학습 프로젝트와의 데이터 계약
+
+학습 프로젝트는 Python `lerobot` 패키지를 의존성으로 사용하지 않고
+`gr00t/data/dataset.py`의 자체 로더로 읽습니다. 따라서 맞춰야 하는 버전은
+pip 패키지 버전이 아니라 데이터 저장 형식입니다. Export는 프로젝트의 demo와 같은
+`codebase_version: v2.0` 구조(episode별 Parquet/MP4, JSON/JSONL meta)를 생성합니다.
+최신 LeRobot v3 형식으로 재변환하지 말고 이 출력 폴더를 그대로 사용합니다.
+Export 의존성의 `pandas==2.2.3`, `pyarrow==14.0.1`, NumPy 1.x는 학습 프로젝트와 맞습니다.
+
+`meta/modality.json`의 인덱스는 Python 슬라이스처럼 시작 포함, 끝 제외입니다.
+
+| State 항목 | 저장 인덱스 | 차원 |
+| --- | --- | --- |
+| prev_command | `[0:4]` | 4 |
+| dvl_velocity | `[4:7]` | 3 |
+| angular_velocity | `[7:10]` | 3 |
+| linear_acceleration | `[10:13]` | 3 |
+| attitude (w, x, y, z) | `[13:17]` | 4 |
+| depth | `[17:18]` | 1 |
+| altitude | `[18:19]` | 1 |
+| validity | `[19:23]` | 4 |
+
+저장 state는 `float32[23]`입니다. 현재 `KMUauvDataConfig`는 validity를 제외하고
+`attitude → dvl_velocity → depth → prev_command → angular_velocity → linear_acceleration
+→ altitude` 순서로 19차원을 연결합니다. 유효성 표시는 파일에 보존되지만 현재 모델
+입력에는 포함되지 않습니다. 학습 transform이 이를 64차원으로 zero padding합니다.
+저장 데이터를 64차원으로 늘릴 필요는 없습니다.
+
+Action은 `float32[4]`의 `[surge, sway, heave, yaw]`이고, 학습 시 현재 frame부터
+16개(`0..15`)의 action을 모아 `[16, 32]`로 padding합니다. 저장 파일에는 frame당
+4차원만 씁니다. Episode 끝의 부족한 action은 로더가 마지막 값으로 padding합니다.
+관측은 현재 frame 하나(`observation_indices=[0]`)입니다.
+
+두 카메라는 RGB, 저장 shape는 `[H, W, 3]`이며 학습 transform에서 각각 224×224로
+resize합니다. 수집 기본값은 10 Hz입니다. 모든 episode의 실제 수집 FPS가 같아야 하며,
+`--fps`로 시간을 바꿀 수 없습니다.
+
+`frame_index`는 episode마다 0부터, `episode_index`와 `task_index`도 0부터 시작합니다.
+`index`는 전체 데이터에서 끊김 없이 증가하며 네 인덱스 모두 `int64`입니다.
+저장 chunk는 episode 1,000개 단위로 증가하고 train 범위는 실제 episode 수를 사용합니다.
+
+학습 실행 시 다음 인자를 사용합니다(모델과 나머지 학습 옵션은 기존 설정 사용).
+
+```text
+--dataset-path /path/to/lerobot_train --data-config kmu_auv --embodiment-tag new_embodiment
+```
+
+`u0_bot` 설정은 joint/PWM/target position을 사용하는 다른 데이터 계약입니다.
+현재 AUV 수집 데이터에는 `kmu_auv`를 사용합니다.
+
+계약 및 export 테스트는 ROS와 별도의 export 환경에서 실행할 수 있습니다.
+
+```bash
+python -m pip install -r requirements-export.txt pytest
+# OpenCV와 시스템 ffmpeg도 필요합니다.
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
+  AUV_VLA_TRAINING_ROOT=/home/pc/Downloads/auv_vla_training python -m pytest test -q
+```
+
+학습 프로젝트 대조 테스트는 GPU 의존성 없이 실제 설정 소스를 검사합니다.
+전체 학습 로더와 모델 실행 검증은 U0 학습 환경에서 별도로 수행해야 합니다.
 
 ## 중요한 제한
 

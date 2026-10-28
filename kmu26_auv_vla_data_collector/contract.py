@@ -34,6 +34,19 @@ STATE_NAMES = (
 
 ACTION_NAMES = ("surge", "sway", "heave", "yaw")
 
+# Half-open offsets in the stored 23-D vector. The training config selects
+# modalities by name and concatenates them in its own order.
+STATE_SLICES = {
+    "prev_command": (0, 4),
+    "dvl_velocity": (4, 7),
+    "angular_velocity": (7, 10),
+    "linear_acceleration": (10, 13),
+    "attitude": (13, 17),
+    "depth": (17, 18),
+    "altitude": (18, 19),
+    "validity": (19, 23),
+}
+
 # MAVROS OverrideRCIn uses zero-based array offsets. ArduSub channels are
 # forward=5, lateral=6, throttle=3, yaw=4.
 DEFAULT_ACTION_CHANNEL_INDICES = (4, 5, 2, 3)
